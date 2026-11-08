@@ -3,7 +3,7 @@ use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{copy, Read, Write};
+use std::io::{copy, BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use tar::Archive;
 
@@ -114,79 +114,27 @@ pub fn extract_unitypackage(
 
         let file = File::open(package_path)
             .with_context(|| format!("Impossible d'ouvrir {}", package_path.display()))?;
-        let decoder = GzDecoder::new(file);
-        let mut archive = Archive::new(decoder);
+        let mut buffered = BufReader::new(file);
+        buffered
+            .fill_buf()
+            .context("Impossible de lire l’en-tête du package")?;
+        let is_gzip = {
+            let buf = buffered.buffer();
+            buf.len() >= 2 && buf[0] == 0x1f && buf[1] == 0x8b
+        };
 
-        let mut entries: HashMap<String, AssetEntry> = HashMap::new();
-        let mut total_members = 0usize;
-
-        for entry in archive.entries().context("Archive tar invalide")? {
-            let mut entry = match entry {
-                Ok(e) => e,
-                Err(err) => {
-                    // Continue on individual corrupt members when possible
-                    eprintln!("Entrée tar ignorée: {err}");
-                    continue;
-                }
-            };
-
-            let path = match entry.path() {
-                Ok(p) => p.into_owned(),
-                Err(_) => continue,
-            };
-
-            let parts: Vec<_> = path
-                .components()
-                .filter_map(|c| match c {
-                    Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
-                    _ => None,
-                })
-                .collect();
-
-            if parts.len() < 2 {
-                continue;
-            }
-
-            let guid = parts[0].clone();
-            let kind = parts[1].as_str();
-            let guid_dir = staging_dir.join(&guid);
-            fs::create_dir_all(&guid_dir)?;
-            let slot = entries.entry(guid).or_default();
-
-            match kind {
-                "pathname" => {
-                    let mut raw = Vec::new();
-                    entry.read_to_end(&mut raw)?;
-                    if let Some(cleaned) = decode_pathname(&raw) {
-                        slot.pathname = Some(cleaned);
-                    }
-                }
-                "asset" => {
-                    let dest = guid_dir.join("asset");
-                    write_entry_to_file(&mut entry, &dest)?;
-                    slot.asset_path = Some(dest);
-                }
-                "asset.meta" => {
-                    let dest = guid_dir.join("asset.meta");
-                    write_entry_to_file(&mut entry, &dest)?;
-                    slot.meta_path = Some(dest);
-                }
-                "preview.png" => {
-                    let dest = guid_dir.join("preview.png");
-                    write_entry_to_file(&mut entry, &dest)?;
-                    slot.preview_path = Some(dest);
-                }
-                _ => {}
-            }
-
-            total_members += 1;
-            if total_members % 50 == 0 {
-                on_progress(
-                    0.05 + (total_members as f32 * 0.0005).min(0.40),
-                    format!("Indexation… {total_members} entrées"),
-                );
-            }
-        }
+        let entries = if is_gzip {
+            on_progress(0.03, "Format détecté: tar.gz".into());
+            index_archive(
+                Archive::new(GzDecoder::new(buffered)),
+                &staging_dir,
+                &mut on_progress,
+            )?
+        } else {
+            // Certains .unitypackage (ex: packs UI) sont un tar brut non gzippé
+            on_progress(0.03, "Format détecté: tar (non compressé)".into());
+            index_archive(Archive::new(buffered), &staging_dir, &mut on_progress)?
+        };
 
         let total_assets = entries.len().max(1) as f32;
         let mut report = ExtractReport {
@@ -265,6 +213,84 @@ pub fn extract_unitypackage(
     // Always clean staging, even on failure
     let _ = fs::remove_dir_all(&staging_dir);
     extract_result
+}
+
+fn index_archive<R: Read>(
+    mut archive: Archive<R>,
+    staging_dir: &Path,
+    on_progress: &mut impl FnMut(f32, String),
+) -> Result<HashMap<String, AssetEntry>> {
+    let mut entries: HashMap<String, AssetEntry> = HashMap::new();
+    let mut total_members = 0usize;
+
+    for entry in archive.entries().context("Archive tar invalide")? {
+        let mut entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("Entrée tar ignorée: {err}");
+                continue;
+            }
+        };
+
+        let path = match entry.path() {
+            Ok(p) => p.into_owned(),
+            Err(_) => continue,
+        };
+
+        let parts: Vec<_> = path
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect();
+
+        if parts.len() < 2 {
+            continue;
+        }
+
+        let guid = parts[0].clone();
+        let kind = parts[1].as_str();
+        let guid_dir = staging_dir.join(&guid);
+        fs::create_dir_all(&guid_dir)?;
+        let slot = entries.entry(guid).or_default();
+
+        match kind {
+            "pathname" => {
+                let mut raw = Vec::new();
+                entry.read_to_end(&mut raw)?;
+                if let Some(cleaned) = decode_pathname(&raw) {
+                    slot.pathname = Some(cleaned);
+                }
+            }
+            "asset" => {
+                let dest = guid_dir.join("asset");
+                write_entry_to_file(&mut entry, &dest)?;
+                slot.asset_path = Some(dest);
+            }
+            "asset.meta" => {
+                let dest = guid_dir.join("asset.meta");
+                write_entry_to_file(&mut entry, &dest)?;
+                slot.meta_path = Some(dest);
+            }
+            "preview.png" => {
+                let dest = guid_dir.join("preview.png");
+                write_entry_to_file(&mut entry, &dest)?;
+                slot.preview_path = Some(dest);
+            }
+            _ => {}
+        }
+
+        total_members += 1;
+        if total_members % 50 == 0 {
+            on_progress(
+                0.05 + (total_members as f32 * 0.0005).min(0.40),
+                format!("Indexation… {total_members} entrées"),
+            );
+        }
+    }
+
+    Ok(entries)
 }
 
 fn write_entry_to_file(entry: &mut tar::Entry<impl Read>, dest: &Path) -> Result<()> {
