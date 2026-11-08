@@ -119,3 +119,5 @@ Pour un usage commercial, contactez l’auteur.
 ## Contribution
 
 Les contributions sont les bienvenues pour un usage non commercial, sous la même licence CC BY-NC-SA 4.0.
+
+**Soutenir Bougli** · [Faire un don PayPal via Streamlabs](https://streamlabs.com/bouglitv) · [Soutenir sur Patreon](https://www.patreon.com/cw/Bougli)
